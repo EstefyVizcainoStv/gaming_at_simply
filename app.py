@@ -1,6 +1,5 @@
 # app.py
 import io
-import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -41,7 +40,13 @@ REQUIRED_HEADERS = [
     "Time to Close","TAM","Closer"
 ]
 
-# Synonyms / normalization (case-insensitive; spaces/underscores ignored)
+# For coverage computation
+DATE_CANONICAL = [
+    "CreatedAt","UpdatedAt","AcknowledgedAt","ProcessingAt","ClosedAt",
+    "ReopenedAt","LastSimplyReplyAt","LastClientReplyAt"
+]
+
+# Synonyms / normalization
 SYNONYMS = {
     "ID": ["id"],
     "ClientID": ["clientid","client_id","client id"],
@@ -64,7 +69,6 @@ SYNONYMS = {
     "Closer": ["closer","agent","assignee","owner","handler"]
 }
 
-# Columns actually used by the app logic
 USED = {
     "status":   "Status",
     "client":   "ClientName",
@@ -83,60 +87,40 @@ DROP_NAMES = {"not found", "nan", "none", ""}
 # Helpers
 # ==============================
 def _norm(s: str) -> str:
-    """Normalize a header: lowercase, strip, collapse spaces/underscores."""
     return "".join(str(s).strip().lower().replace("_", " ").split())
 
 def resolve_schema(df: pd.DataFrame):
-    """Return colmap (canonical→actual) and missing canonical headers."""
     actual_norm = {_norm(c): c for c in df.columns}
     colmap, missing = {}, []
     for canonical in REQUIRED_HEADERS:
         candidates = [_norm(canonical)] + [_norm(a) for a in SYNONYMS.get(canonical, [])]
         found = next((actual_norm[c] for c in candidates if c in actual_norm), None)
-        if found: colmap[canonical] = found
-        else:     missing.append(canonical)
+        (colmap.__setitem__(canonical, found) if found else missing.append(canonical))
     return colmap, missing
 
 def load_any(uploaded):
-    """Load ONLY from the uploader (CSV/TSV/XLS/XLSX). No local fallbacks."""
+    """Load ONLY from the uploader (CSV/TSV/XLS/XLSX)."""
     if uploaded is None:
         return None
-
     name = (getattr(uploaded, "name", "") or "").lower()
-
-    # Ensure pointer at start
-    try:
-        uploaded.seek(0)
-    except Exception:
-        pass
-
+    try: uploaded.seek(0)
+    except Exception: pass
     if name.endswith((".xls", ".xlsx")):
         df = pd.read_excel(uploaded)
     else:
-        # Read bytes once, then try common delimiters
         raw = uploaded.read()
-        for sep in [",", ";", "\t", "|"]:
+        for sep in [",",";","\t","|"]:
             try:
                 df = pd.read_csv(io.BytesIO(raw), sep=sep)
-                # If everything collapsed into one column, try next separator
-                if df.shape[1] == 1 and sep != ",":
+                if df.shape[1] == 1 and sep != ",":  # try next sep
                     continue
                 break
             except Exception:
                 df = None
         if df is None:
-            df = pd.read_csv(io.BytesIO(raw))  # last resort
-
+            df = pd.read_csv(io.BytesIO(raw))
     df.columns = [str(c).strip() for c in df.columns]
     return df
-
-def safe_col(colmap, canonical, *fallbacks):
-    if canonical in colmap: 
-        return colmap[canonical]
-    for fb in fallbacks:
-        if fb in colmap:
-            return colmap[fb]
-    return None
 
 def clean_people(s: pd.Series) -> pd.Series:
     return s.astype("string").str.strip().str.replace(r"\s+", " ", regex=True)
@@ -147,7 +131,6 @@ def percent_rank(series: pd.Series) -> pd.Series:
     return series.rank(pct=True, method="average")
 
 def ttc_to_hours(s: pd.Series) -> pd.Series:
-    """Coerce 'Time to Close' to hours."""
     s = s.astype("string").str.strip()
     h_num = pd.to_numeric(s, errors="coerce")
     mask = h_num.isna()
@@ -167,25 +150,20 @@ def compute_reopen(df, closer_col, reopened_col):
         tmp[reopened_col] = pd.to_datetime(tmp[reopened_col], errors="coerce", dayfirst=True)
     else:
         tmp[reopened_col] = pd.NaT
-
     tmp["_reopened_flag"] = tmp[reopened_col].notna()
-
     quality = (
         tmp.groupby(closer_col)
-           .agg(tickets_closed=("_reopened_flag", "size"),
-                reopens=("_reopened_flag", "sum"))
+           .agg(tickets_closed=("_reopened_flag","size"),
+                reopens=("_reopened_flag","sum"))
            .reset_index()
     )
     quality["reopen_rate"] = quality["reopens"] / quality["tickets_closed"].replace(0, np.nan)
     quality["reopen_rate"] = quality["reopen_rate"].fillna(0.0)
-
     MAX_PEN = 15.0
     quality["penalty"] = (percent_rank(quality["reopen_rate"]) * MAX_PEN).round(1)
     return quality
 
-def score_closer_table(
-    df, closer_col, client_col, ttc_col, reopened_col, status_col, hours_col=None
-):
+def score_closer_table(df, closer_col, client_col, ttc_col, reopened_col, status_col, hours_col=None):
     d = df.copy()
     d[closer_col] = clean_people(d[closer_col])
     d = d[d[closer_col].notna()]
@@ -199,42 +177,29 @@ def score_closer_table(
     vol = d.groupby(closer_col).size().reset_index(name="Tickets Closed")
     uniq_clients = d.groupby(closer_col)[client_col].nunique().reset_index(name="Unique Clients")
     per_client = vol.merge(uniq_clients, on=closer_col, how="left")
-    per_client["Closed per Client"] = (
-        per_client["Tickets Closed"] / per_client["Unique Clients"].replace(0, np.nan)
-    )
+    per_client["Closed per Client"] = per_client["Tickets Closed"] / per_client["Unique Clients"].replace(0, np.nan)
 
     speed_base = d.copy()
     if status_col in speed_base.columns and status_col is not None:
         mask = ~speed_base[status_col].astype(str).str.lower().isin(EXCLUDE_STATUSES_FOR_SPEED)
         speed_base = speed_base[mask]
+    speed = speed_base.groupby(closer_col)[hours_col].mean().reset_index().rename(columns={hours_col:"Avg Close (h)"})
 
-    speed = (
-        speed_base.groupby(closer_col)[hours_col].mean().reset_index()
-                  .rename(columns={hours_col: "Avg Close (h)"})
-    )
-
-    lb = (
-        vol.merge(per_client[[closer_col, "Closed per Client", "Unique Clients"]], on=closer_col, how="left")
-           .merge(speed, on=closer_col, how="left")
-    )
+    lb = vol.merge(per_client[[closer_col,"Closed per Client","Unique Clients"]], on=closer_col, how="left") \
+            .merge(speed, on=closer_col, how="left")
 
     lb["Volume Score (0–100)"]     = (percent_rank(lb["Tickets Closed"]) * 100).round(1)
     lb["Throughput Score (0–100)"] = (percent_rank(lb["Closed per Client"]) * 100).round(1)
     lb["Speed Score (0–100)"]      = ((1 - percent_rank(lb["Avg Close (h)"])) * 100).round(1)
 
     w_speed, w_through, w_vol = 0.30, 0.40, 0.30
-    lb["POWER SCORE (0–100)"] = (
-        lb["Speed Score (0–100)"] * w_speed
-      + lb["Throughput Score (0–100)"] * w_through
-      + lb["Volume Score (0–100)"] * w_vol
-    ).round(1)
+    lb["POWER SCORE (0–100)"] = (lb["Speed Score (0–100)"]*w_speed
+                                 + lb["Throughput Score (0–100)"]*w_through
+                                 + lb["Volume Score (0–100)"]*w_vol).round(1)
 
     quality = compute_reopen(d, closer_col, reopened_col)
-    lb = lb.merge(
-        quality[[closer_col, "reopen_rate", "penalty", "reopens", "tickets_closed"]],
-        on=closer_col, how="left"
-    ).fillna({"reopen_rate":0.0, "penalty":0.0, "reopens":0, "tickets_closed":0})
-
+    lb = lb.merge(quality[[closer_col,"reopen_rate","penalty","reopens","tickets_closed"]], on=closer_col, how="left") \
+           .fillna({"reopen_rate":0.0,"penalty":0.0,"reopens":0,"tickets_closed":0})
     lb["Adj POWER SCORE (0–100)"] = (lb["POWER SCORE (0–100)"] - lb["penalty"]).clip(lower=0)
 
     lb["Title"] = np.where(lb["Speed Score (0–100)"] >= 70, "Lightning Closer", "Steady Operator")
@@ -245,22 +210,16 @@ def score_closer_table(
         return "Rare 🟢"
     lb["Tier"] = lb["Adj POWER SCORE (0–100)"].apply(tier_from_score)
 
-    lb = lb.rename(columns={closer_col: "Closer"})
-    lb = lb.sort_values("Adj POWER SCORE (0–100)", ascending=False).reset_index(drop=True)
-    lb.insert(0, "Rank", lb.index + 1)
+    lb = lb.rename(columns={closer_col:"Closer"}).sort_values("Adj POWER SCORE (0–100)", ascending=False).reset_index(drop=True)
+    lb.insert(0,"Rank", lb.index + 1)
 
-    cols = [
-        "Rank","Closer","Title","Tier",
-        "Adj POWER SCORE (0–100)","penalty",
-        "Speed Score (0–100)","Throughput Score (0–100)","Volume Score (0–100)",
-        "Avg Close (h)","Tickets Closed","Unique Clients","Closed per Client",
-        "reopens","reopen_rate"
-    ]
-    lb = lb[cols].rename(columns={
-        "penalty":"Re-open Penalty (0–15)",
-        "reopen_rate":"Re-open Rate",
-        "reopens":"Reopens"
-    })
+    cols = ["Rank","Closer","Title","Tier","Adj POWER SCORE (0–100)","penalty",
+            "Speed Score (0–100)","Throughput Score (0–100)","Volume Score (0–100)",
+            "Avg Close (h)","Tickets Closed","Unique Clients","Closed per Client",
+            "reopens","reopen_rate"]
+    lb = lb[cols].rename(columns={"penalty":"Re-open Penalty (0–15)",
+                                  "reopen_rate":"Re-open Rate",
+                                  "reopens":"Reopens"})
     return lb
 
 def styled_table(df: pd.DataFrame) -> str:
@@ -286,64 +245,24 @@ def styled_table(df: pd.DataFrame) -> str:
           .bar(subset=["Closed per Client"], color="#10b981")
     )
     html = s.to_html()
-    html = html.replace("<tbody>", "<tbody>").replace("<th></th>", "")
-    return html
-
-def achievement_card(row, place):
-    medal = {1:"🥇", 2:"🥈", 3:"🥉"}[place]
-    grad  = {1:"linear-gradient(90deg,#f59e0b,#b45309)",
-             2:"linear-gradient(90deg,#9ca3af,#6b7280)",
-             3:"linear-gradient(90deg,#b45309,#92400e)"}[place]
-    name  = row["Closer"]
-    title = row["Title"]
-    tier  = row["Tier"]
-    adj   = f'{row["Adj POWER SCORE (0–100)"]:.1f}'
-    pen   = f'{row["Re-open Penalty (0–15)"]:.1f}'
-    rate  = f'{row["Re-open Rate"]:.2%}'
-    avg   = f'{row["Avg Close (h)"]:.2f}'
-    per   = f'{row["Closed per Client"]:.2f}'
-    vol   = f'{row["Tickets Closed"]:.0f}'
-
-    st.markdown(
-        f"""
-        <div class="card">
-          <div class="card-h" style="background:{grad}">{medal} ACHIEVEMENT UNLOCKED</div>
-          <div class="card-b">
-            <div class="big">CLOSER: {name}</div>
-            <div class="meta">Title: “{title}”</div>
-            <div class="meta">Tier: {tier}</div>
-            <div class="pow">Adjusted Power: {adj}</div>
-            <div class="sub">(Penalty: {pen} · Re-open rate: {rate})</div>
-            <div class="stats">
-              <div>Avg Close (h): <b>{avg}</b></div>
-              <div>Closed per Client: <b>{per}</b></div>
-              <div>Tickets Closed: <b>{vol}</b></div>
-            </div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    return html.replace("<th></th>", "")
 
 def weekly_winner(df, closer_col, client_col, hrs_col, reopened_col, status_col, closed_col, created_col):
-    """Return (top_row, 'YYYY-Www') for the latest ISO week using ClosedAt (fallback CreatedAt)."""
+    """Return (top_row, latest_week_label) — we won't display the label anymore."""
     date_col = closed_col if closed_col in df.columns and closed_col else created_col
     if not date_col or date_col not in df.columns:
         return None, None
-
     d = df.copy()
     d[date_col] = pd.to_datetime(d[date_col], errors="coerce", dayfirst=True)
     d = d[d[date_col].notna()]
     if d.empty:
         return None, None
-
     iso = d[date_col].dt.isocalendar()
     d["_week"] = iso.year.astype(str) + "-W" + iso.week.astype(str).str.zfill(2)
     latest_week = d["_week"].sort_values().iloc[-1]
     dweek = d[d["_week"] == latest_week].copy()
     if dweek.empty:
         return None, None
-
     lbw = score_closer_table(
         dweek, closer_col=closer_col, client_col=client_col,
         ttc_col=hrs_col, reopened_col=reopened_col, status_col=status_col,
@@ -352,6 +271,20 @@ def weekly_winner(df, closer_col, client_col, hrs_col, reopened_col, status_col,
     if lbw.empty:
         return None, None
     return lbw.iloc[0], latest_week
+
+def compute_coverage(df: pd.DataFrame, actual_date_cols: list):
+    """Return (start_dt, end_dt) across all provided date columns."""
+    stacks = []
+    for c in actual_date_cols:
+        if c in df.columns:
+            stacks.append(pd.to_datetime(df[c], errors="coerce", dayfirst=True))
+    if not stacks:
+        return None, None
+    s = pd.concat(stacks, axis=0)
+    s = s[s.notna()]
+    if s.empty:
+        return None, None
+    return s.min(), s.max()
 
 # ==============================
 # Sidebar — data load & schema
@@ -375,8 +308,7 @@ if df is None or df.empty:
 colmap, missing = resolve_schema(df)
 
 with st.expander("Schema check", expanded=bool(missing)):
-    ok = "✅"
-    bad = "❌"
+    ok, bad = "✅", "❌"
     st.write("\n".join(f"{ok if h in colmap else bad} {h} → {colmap.get(h,'(missing)')}"
                        for h in REQUIRED_HEADERS))
 if missing:
@@ -392,6 +324,24 @@ ttc_col      = colmap[USED["ttc"]]
 reopened_col = colmap[USED["reopened"]]
 closed_col   = colmap[USED["closed"]]
 created_col  = colmap[USED["created"]]
+
+# ---------- Data coverage (calendar display) ----------
+actual_date_cols = [colmap[c] for c in DATE_CANONICAL if c in colmap]
+start_dt, end_dt = compute_coverage(df, actual_date_cols)
+
+st.sidebar.header("Data coverage")
+if start_dt and end_dt:
+    # Calendar-style range showing coverage (informational only)
+    st.sidebar.date_input(
+        "Dates present in file",
+        value=(start_dt.date(), end_dt.date()),
+        min_value=start_dt.date(),
+        max_value=end_dt.date(),
+        key="data_coverage_range"
+    )
+    st.caption(f"Data coverage: **{start_dt:%Y-%m-%d} → {end_dt:%Y-%m-%d}**")
+else:
+    st.sidebar.info("No valid dates detected in the date columns.")
 
 # Filters
 st.sidebar.header("Filters")
@@ -415,26 +365,23 @@ df[hrs_col] = ttc_to_hours(df[ttc_col])
 # ==============================
 with st.container():
     k1, k2, k3, k4 = st.columns(4)
-    total_tickets = len(df)
-    unique_clients = df[client_col].nunique()
-    unique_closers = df[closer_col].nunique()
+    k1.metric("Tickets", f"{len(df):,}")
+    k2.metric("Unique Clients", f"{df[client_col].nunique():,}")
+    k3.metric("Closers", f"{df[closer_col].nunique():,}")
     avg_ttc = df[hrs_col].mean()
-    k1.metric("Tickets", f"{total_tickets:,}")
-    k2.metric("Unique Clients", f"{unique_clients:,}")
-    k3.metric("Closers", f"{unique_closers:,}")
     k4.metric("Avg Close (h)", f"{avg_ttc:.2f}" if pd.notna(avg_ttc) else "—")
 
 st.markdown("---")
 
-# Winner of the Week banner
-topw, week_label = weekly_winner(df, closer_col, client_col, hrs_col,
-                                 reopened_col, status_col, closed_col, created_col)
+# Winner banner (without the week label)
+topw, _week_label = weekly_winner(df, closer_col, client_col, hrs_col,
+                                  reopened_col, status_col, closed_col, created_col)
 if topw is not None:
     st.markdown(
         f"""
         <div style="margin:8px 0 18px; padding:14px 18px; background:#0ea5e9; color:white;
                     border-radius:14px; box-shadow:0 8px 18px rgba(0,0,0,.10);">
-          <div style="font-weight:800; font-size:18px;">🏁 Winner of <span style="opacity:.9">{week_label}</span></div>
+          <div style="font-weight:800; font-size:18px;">🏁 Winner</div>
           <div style="display:flex; gap:22px; align-items:baseline; flex-wrap:wrap;">
             <div style="font-size:30px; font-weight:800;">{topw['Closer']}</div>
             <div>Adj Power: <b>{topw['Adj POWER SCORE (0–100)']:.1f}</b></div>
@@ -486,7 +433,7 @@ with tab1:
     )
     c2.plotly_chart(fig_closer, use_container_width=True)
 
-    # Fastest closers (avg hours) — exclude pending/processing
+    # Fastest closers (avg hours)
     avg_df = (
         df_closed.groupby(closer_col)[hrs_col].mean().reset_index()
                  .rename(columns={hrs_col:"avg_hours"})
@@ -516,7 +463,7 @@ with tab1:
             )
             fig_re = px.bar(
                 r_week, x="tickets_reopened", y=closer_col, orientation="h", color="tickets_reopened",
-                title=f"🔄 Re-open Champion (latest week: {latest_week})",
+                title=f"🔄 Re-open Champion (latest week)",
                 labels={"tickets_reopened":"Tickets Reopened", closer_col:"Closer"},
                 template="simple_white",
             )
@@ -556,5 +503,3 @@ with tab3:
         with c: achievement_card(top3.iloc[2], 3)
 
     st.markdown('<div class="note">Tip: use the sidebar to exclude names or change Top-N on charts.</div>', unsafe_allow_html=True)
-
-
