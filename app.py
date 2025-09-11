@@ -426,15 +426,16 @@ with st.container():
 
 st.markdown("---")
 
-# Winner of the Week banner
-topw, week_label = weekly_winner(df, closer_col, client_col, hrs_col,
-                                 reopened_col, status_col, closed_col, created_col)
+# Winner banner (no week label)
+topw, _ = weekly_winner(df, closer_col, client_col, hrs_col,
+                        reopened_col, status_col, closed_col, created_col)
 if topw is not None:
     st.markdown(
         f"""
         <div style="margin:8px 0 18px; padding:14px 18px; background:#0ea5e9; color:white;
                     border-radius:14px; box-shadow:0 8px 18px rgba(0,0,0,.10);">
-          <div style="font-weight:800; font-size:18px;">🏁 Winner of <span style="opacity:.9">{week_label}</span></div>
+          <div style="font-weight:800; font-size:18px;">🏁 Winner</div>
+
           <div style="display:flex; gap:22px; align-items:baseline; flex-wrap:wrap;">
             <div style="font-size:30px; font-weight:800;">{topw['Closer']}</div>
             <div>Adj Power: <b>{topw['Adj POWER SCORE (0–100)']:.1f}</b></div>
