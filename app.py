@@ -34,7 +34,6 @@ st.markdown(
 # ==============================
 # Required / canonical headers
 # ==============================
-# Canonical names (your contract)
 REQUIRED_HEADERS = [
     "ID","ClientID","Status","Title","Field","Service","Category",
     "CreatedAt","UpdatedAt","AcknowledgedAt","ProcessingAt","ClosedAt",
@@ -42,7 +41,7 @@ REQUIRED_HEADERS = [
     "Time to Close","TAM","Closer"
 ]
 
-# Synonyms / normalization for robustness (case-insensitive; spaces/underscores ignored)
+# Synonyms / normalization (case-insensitive; spaces/underscores ignored)
 SYNONYMS = {
     "ID": ["id"],
     "ClientID": ["clientid","client_id","client id"],
@@ -65,7 +64,7 @@ SYNONYMS = {
     "Closer": ["closer","agent","assignee","owner","handler"]
 }
 
-# Columns actually used by the app logic (others can exist but aren’t strictly needed for charts)
+# Columns actually used by the app logic
 USED = {
     "status":   "Status",
     "client":   "ClientName",
@@ -77,8 +76,8 @@ USED = {
     "reopened": "ReopenedAt",
 }
 
-EXCLUDE_STATUSES_FOR_SPEED = {"pending", "processing"}  # filter for speed/efficiency charts
-DROP_NAMES = {"not found", "nan", "none", ""}           # garbage tokens (case-insensitive)
+EXCLUDE_STATUSES_FOR_SPEED = {"pending", "processing"}
+DROP_NAMES = {"not found", "nan", "none", ""}
 
 # ==============================
 # Helpers
@@ -88,67 +87,50 @@ def _norm(s: str) -> str:
     return "".join(str(s).strip().lower().replace("_", " ").split())
 
 def resolve_schema(df: pd.DataFrame):
-    """
-    Return:
-      - colmap: dict canonical->actual column in df
-      - missing: list of canonical headers not present
-    """
+    """Return colmap (canonical→actual) and missing canonical headers."""
     actual_norm = {_norm(c): c for c in df.columns}
-    colmap = {}
-    missing = []
+    colmap, missing = {}, []
     for canonical in REQUIRED_HEADERS:
-        candidates = [_norm(canonical)]
-        candidates += [_norm(a) for a in SYNONYMS.get(canonical, [])]
-        found = None
-        for cand in candidates:
-            if cand in actual_norm:
-                found = actual_norm[cand]
-                break
-        if found:
-            colmap[canonical] = found
-        else:
-            missing.append(canonical)
+        candidates = [_norm(canonical)] + [_norm(a) for a in SYNONYMS.get(canonical, [])]
+        found = next((actual_norm[c] for c in candidates if c in actual_norm), None)
+        if found: colmap[canonical] = found
+        else:     missing.append(canonical)
     return colmap, missing
 
 def load_any(uploaded):
-    """Load CSV/TSV/XLSX; be liberal with delimiters; trim header whitespace."""
+    """Load ONLY from the uploader (CSV/TSV/XLS/XLSX). No local fallbacks."""
     if uploaded is None:
-        # Optional fallback if you keep a sample next to the app
-        for p in ["GAMING 2.csv", "/mnt/data/GAMING 2.csv", "/mnt/data/gaming3.csv", "data/sample.csv"]:
-            if os.path.exists(p):
-                uploaded = open(p, "rb")
-                break
-        if uploaded is None:
-            return None
+        return None
 
-    name = getattr(uploaded, "name", "uploaded")
-    data = uploaded.read() if hasattr(uploaded, "read") else uploaded
-    if hasattr(uploaded, "seek"):
+    name = (getattr(uploaded, "name", "") or "").lower()
+
+    # Ensure pointer at start
+    try:
         uploaded.seek(0)
+    except Exception:
+        pass
 
-    # Try Excel first
-    if name.lower().endswith((".xls", ".xlsx")):
-        df = pd.read_excel(io.BytesIO(data))
+    if name.endswith((".xls", ".xlsx")):
+        df = pd.read_excel(uploaded)
     else:
-        # Try common delimiters
+        # Read bytes once, then try common delimiters
+        raw = uploaded.read()
         for sep in [",", ";", "\t", "|"]:
             try:
-                df = pd.read_csv(io.BytesIO(data), sep=sep)
-                # Heuristic: if it's clearly one big column, try next sep
+                df = pd.read_csv(io.BytesIO(raw), sep=sep)
+                # If everything collapsed into one column, try next separator
                 if df.shape[1] == 1 and sep != ",":
                     continue
                 break
             except Exception:
                 df = None
         if df is None:
-            df = pd.read_csv(io.BytesIO(data))  # last resort
+            df = pd.read_csv(io.BytesIO(raw))  # last resort
 
-    # Trim headers
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 def safe_col(colmap, canonical, *fallbacks):
-    """Return the actual column in df for a canonical name (or a provided fallback)."""
     if canonical in colmap: 
         return colmap[canonical]
     for fb in fallbacks:
@@ -164,30 +146,15 @@ def percent_rank(series: pd.Series) -> pd.Series:
         return pd.Series(0.5, index=series.index)
     return series.rank(pct=True, method="average")
 
-# --- Robust TTC (Time to Close) -> hours parser ---
 def ttc_to_hours(s: pd.Series) -> pd.Series:
-    """
-    Coerce Time to Close to hours.
-    - Numeric strings like '11.5' are treated as HOURS (11.5h).
-    - Durations like '1 day 02:15:00', '02:15:00', '12h 30m', '45m', '90s'
-      are parsed via to_timedelta and converted to hours.
-    - Negative or absurd outliers are nulled.
-    """
+    """Coerce 'Time to Close' to hours."""
     s = s.astype("string").str.strip()
-
-    # 1) numeric-as-hours first
     h_num = pd.to_numeric(s, errors="coerce")
-
-    # 2) anything not numeric → try timedelta
     mask = h_num.isna()
     td = pd.to_timedelta(s[mask], errors="coerce")
     h_td = (td / np.timedelta64(1, "h")).astype("float")
-
-    # stitch back
     hours = h_num.copy()
     hours[mask] = h_td
-
-    # normalize: drop negatives & crazy outliers
     hours = hours.where(hours >= 0)
     if hours.notna().sum() > 5:
         p99 = np.nanpercentile(hours, 99)
@@ -212,7 +179,6 @@ def compute_reopen(df, closer_col, reopened_col):
     quality["reopen_rate"] = quality["reopens"] / quality["tickets_closed"].replace(0, np.nan)
     quality["reopen_rate"] = quality["reopen_rate"].fillna(0.0)
 
-    # penalty 0..15 by percentile
     MAX_PEN = 15.0
     quality["penalty"] = (percent_rank(quality["reopen_rate"]) * MAX_PEN).round(1)
     return quality
@@ -221,29 +187,22 @@ def score_closer_table(
     df, closer_col, client_col, ttc_col, reopened_col, status_col, hours_col=None
 ):
     d = df.copy()
-
-    # sanitize closer names
     d[closer_col] = clean_people(d[closer_col])
     d = d[d[closer_col].notna()]
     d = d[~d[closer_col].str.lower().isin(DROP_NAMES)]
 
-    # choose hours for speed
     if hours_col is None:
         if not np.issubdtype(d[ttc_col].dtype, np.number):
             d[ttc_col] = pd.to_numeric(d[ttc_col], errors="coerce")
         hours_col = ttc_col
 
-    # --- Volume pillars
     vol = d.groupby(closer_col).size().reset_index(name="Tickets Closed")
-
-    # unique clients & per-client throughput
     uniq_clients = d.groupby(closer_col)[client_col].nunique().reset_index(name="Unique Clients")
     per_client = vol.merge(uniq_clients, on=closer_col, how="left")
     per_client["Closed per Client"] = (
         per_client["Tickets Closed"] / per_client["Unique Clients"].replace(0, np.nan)
     )
 
-    # --- Speed (exclude pending/processing)
     speed_base = d.copy()
     if status_col in speed_base.columns and status_col is not None:
         mask = ~speed_base[status_col].astype(str).str.lower().isin(EXCLUDE_STATUSES_FOR_SPEED)
@@ -254,18 +213,15 @@ def score_closer_table(
                   .rename(columns={hours_col: "Avg Close (h)"})
     )
 
-    # Merge pillars
     lb = (
         vol.merge(per_client[[closer_col, "Closed per Client", "Unique Clients"]], on=closer_col, how="left")
            .merge(speed, on=closer_col, how="left")
     )
 
-    # --- Scores via percentile ranks (robust)
     lb["Volume Score (0–100)"]     = (percent_rank(lb["Tickets Closed"]) * 100).round(1)
     lb["Throughput Score (0–100)"] = (percent_rank(lb["Closed per Client"]) * 100).round(1)
     lb["Speed Score (0–100)"]      = ((1 - percent_rank(lb["Avg Close (h)"])) * 100).round(1)
 
-    # Base power (weights)
     w_speed, w_through, w_vol = 0.30, 0.40, 0.30
     lb["POWER SCORE (0–100)"] = (
         lb["Speed Score (0–100)"] * w_speed
@@ -273,7 +229,6 @@ def score_closer_table(
       + lb["Volume Score (0–100)"] * w_vol
     ).round(1)
 
-    # Re-open penalty & adjusted power
     quality = compute_reopen(d, closer_col, reopened_col)
     lb = lb.merge(
         quality[[closer_col, "reopen_rate", "penalty", "reopens", "tickets_closed"]],
@@ -282,7 +237,6 @@ def score_closer_table(
 
     lb["Adj POWER SCORE (0–100)"] = (lb["POWER SCORE (0–100)"] - lb["penalty"]).clip(lower=0)
 
-    # Titles + tiers
     lb["Title"] = np.where(lb["Speed Score (0–100)"] >= 70, "Lightning Closer", "Steady Operator")
     def tier_from_score(s):
         if s >= 80: return "Mythic 🟣"
@@ -410,7 +364,7 @@ st.title("Client Support — Closer Dashboard")
 
 if df is None or df.empty:
     st.info(
-        "👋 Upload a file with the required headers:\n\n"
+        "👋 Please upload a file with the required headers to start.\n\n"
         "`ID, ClientID, Status, Title, Field, Service, Category, CreatedAt, UpdatedAt, "
         "AcknowledgedAt, ProcessingAt, ClosedAt, ReopenedAt, LastSimplyReplyAt, "
         "LastClientReplyAt, ClientName, Time to Close, TAM, Closer`"
@@ -423,10 +377,8 @@ colmap, missing = resolve_schema(df)
 with st.expander("Schema check", expanded=bool(missing)):
     ok = "✅"
     bad = "❌"
-    cols_state = []
-    for h in REQUIRED_HEADERS:
-        cols_state.append(f"{ok if h in colmap else bad} {h} → {colmap.get(h,'(missing)')}")
-    st.write("\n".join(cols_state))
+    st.write("\n".join(f"{ok if h in colmap else bad} {h} → {colmap.get(h,'(missing)')}"
+                       for h in REQUIRED_HEADERS))
 if missing:
     st.error(f"Your file is missing required columns: {', '.join(missing)}")
     st.stop()
@@ -604,4 +556,5 @@ with tab3:
         with c: achievement_card(top3.iloc[2], 3)
 
     st.markdown('<div class="note">Tip: use the sidebar to exclude names or change Top-N on charts.</div>', unsafe_allow_html=True)
+
 
