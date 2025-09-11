@@ -144,10 +144,25 @@ def ttc_to_hours(s: pd.Series) -> pd.Series:
         hours = hours.where(hours <= p99)
     return hours
 
+# -------- Robust date parsing to avoid epoch/placeholder dates --------
+BAD_DATE_TOKENS = {"", "0", "0000-00-00", "1900-01-01", "1970-01-01", "none", "nan"}
+MIN_VALID_YEAR = 1995  # tweak if you truly have earlier data
+
+def parse_date_series(x: pd.Series) -> pd.Series:
+    """Treat placeholders & zeros as NaT; clamp absurd years."""
+    s = x.astype("string").str.strip()
+    mask_bad = s.str.lower().isin(BAD_DATE_TOKENS) | s.str.fullmatch(r"0+")
+    s = s.where(~mask_bad, None)
+    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    if dt.notna().any():
+        this_year = pd.Timestamp("today").year
+        dt = dt.where((dt.dt.year >= MIN_VALID_YEAR) & (dt.dt.year <= this_year + 1))
+    return dt
+
 def compute_reopen(df, closer_col, reopened_col):
     tmp = df.copy()
     if reopened_col in tmp.columns:
-        tmp[reopened_col] = pd.to_datetime(tmp[reopened_col], errors="coerce", dayfirst=True)
+        tmp[reopened_col] = parse_date_series(tmp[reopened_col])
     else:
         tmp[reopened_col] = pd.NaT
     tmp["_reopened_flag"] = tmp[reopened_col].notna()
@@ -248,12 +263,12 @@ def styled_table(df: pd.DataFrame) -> str:
     return html.replace("<th></th>", "")
 
 def weekly_winner(df, closer_col, client_col, hrs_col, reopened_col, status_col, closed_col, created_col):
-    """Return (top_row, latest_week_label) — we won't display the label anymore."""
+    """Return (top_row, latest_week_label) — week label not displayed in UI."""
     date_col = closed_col if closed_col in df.columns and closed_col else created_col
     if not date_col or date_col not in df.columns:
         return None, None
     d = df.copy()
-    d[date_col] = pd.to_datetime(d[date_col], errors="coerce", dayfirst=True)
+    d[date_col] = parse_date_series(d[date_col])
     d = d[d[date_col].notna()]
     if d.empty:
         return None, None
@@ -273,11 +288,11 @@ def weekly_winner(df, closer_col, client_col, hrs_col, reopened_col, status_col,
     return lbw.iloc[0], latest_week
 
 def compute_coverage(df: pd.DataFrame, actual_date_cols: list):
-    """Return (start_dt, end_dt) across all provided date columns."""
+    """Return (start_dt, end_dt) across all provided date columns (sanitized)."""
     stacks = []
     for c in actual_date_cols:
         if c in df.columns:
-            stacks.append(pd.to_datetime(df[c], errors="coerce", dayfirst=True))
+            stacks.append(parse_date_series(df[c]))
     if not stacks:
         return None, None
     s = pd.concat(stacks, axis=0)
@@ -331,7 +346,6 @@ start_dt, end_dt = compute_coverage(df, actual_date_cols)
 
 st.sidebar.header("Data coverage")
 if start_dt and end_dt:
-    # Calendar-style range showing coverage (informational only)
     st.sidebar.date_input(
         "Dates present in file",
         value=(start_dt.date(), end_dt.date()),
@@ -339,7 +353,7 @@ if start_dt and end_dt:
         max_value=end_dt.date(),
         key="data_coverage_range"
     )
-    st.caption(f"Data coverage: **{start_dt:%Y-%m-%d} → {end_dt:%Y-%m-%d}**")
+    st.sidebar.caption(f"Data coverage: **{start_dt:%Y-%m-%d} → {end_dt:%Y-%m-%d}**")
 else:
     st.sidebar.info("No valid dates detected in the date columns.")
 
@@ -450,7 +464,7 @@ with tab1:
     # Re-open champion (latest week with data)
     if reopened_col:
         tmp = df.copy()
-        tmp[reopened_col] = pd.to_datetime(tmp[reopened_col], errors="coerce", dayfirst=True)
+        tmp[reopened_col] = parse_date_series(tmp[reopened_col])
         tmp = tmp[tmp[reopened_col].notna()]
         if len(tmp):
             iso = tmp[reopened_col].dt.isocalendar()
@@ -477,10 +491,8 @@ with tab2:
         ttc_col=ttc_col, reopened_col=reopened_col, status_col=status_col,
         hours_col=hrs_col
     )
-
     st.subheader("🏆 Power Leaderboard (Closer) — with Re-open Penalty & Normalized Scores")
     st.caption("Adjusted Power = 0.3·Speed + 0.4·Per-Client + 0.3·Volume − Penalty (0–15).")
-
     st.markdown(styled_table(lb), unsafe_allow_html=True)
 
     with st.expander("Show raw table"):
@@ -493,13 +505,19 @@ with tab3:
         ttc_col=ttc_col, reopened_col=reopened_col, status_col=status_col,
         hours_col=hrs_col
     )
-    top3 = lb.head(3).reset_index(drop=True)
-    a,b,c = st.columns(3)
-    if len(top3) > 0:
-        with a: achievement_card(top3.iloc[0], 1)
-    if len(top3) > 1:
-        with b: achievement_card(top3.iloc[1], 2)
-    if len(top3) > 2:
-        with c: achievement_card(top3.iloc[2], 3)
+    if lb.empty:
+        st.info("No data available for achievements.")
+    else:
+        top3 = lb.head(3).reset_index(drop=True)
+        col1, col2, col3 = st.columns(3)
+        if len(top3) > 0:
+            with col1: 
+                achievement_card(top3.iloc[0], 1)
+        if len(top3) > 1:
+            with col2: 
+                achievement_card(top3.iloc[1], 2)
+        if len(top3) > 2:
+            with col3: 
+                achievement_card(top3.iloc[2], 3)
 
     st.markdown('<div class="note">Tip: use the sidebar to exclude names or change Top-N on charts.</div>', unsafe_allow_html=True)
