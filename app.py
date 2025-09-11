@@ -1,4 +1,5 @@
 # app.py
+import io
 import os
 import numpy as np
 import pandas as pd
@@ -31,67 +32,175 @@ st.markdown(
 )
 
 # ==============================
-# Configuration / column names
+# Required / canonical headers
 # ==============================
-COLS = {
-    "status": "Status",
-    "client": "ClientName",
-    "tam": "TAM",
-    "closer": "Closer",
-    "ttc": "Time to Close",          # numeric hours
-    "created": "CreatedAt",
-    "closed": "ClosedAt",
+# Canonical names (your contract)
+REQUIRED_HEADERS = [
+    "ID","ClientID","Status","Title","Field","Service","Category",
+    "CreatedAt","UpdatedAt","AcknowledgedAt","ProcessingAt","ClosedAt",
+    "ReopenedAt","LastSimplyReplyAt","LastClientReplyAt","ClientName",
+    "Time to Close","TAM","Closer"
+]
+
+# Synonyms / normalization for robustness (case-insensitive; spaces/underscores ignored)
+SYNONYMS = {
+    "ID": ["id"],
+    "ClientID": ["clientid","client_id","client id"],
+    "Status": ["status"],
+    "Title": ["title"],
+    "Field": ["field"],
+    "Service": ["service"],
+    "Category": ["category"],
+    "CreatedAt": ["createdat","created_at","created at","openedat","opened_at","opened at"],
+    "UpdatedAt": ["updatedat","updated_at","updated at","lastupdatedat","last updated at"],
+    "AcknowledgedAt": ["acknowledgedat","ack_at","acknowledged at","acknowledged"],
+    "ProcessingAt": ["processingat","processing_at","processing at"],
+    "ClosedAt": ["closedat","closed_at","closed at","resolvedat","resolved_at","resolved at"],
+    "ReopenedAt": ["reopenedat","reopened_at","reopened at"],
+    "LastSimplyReplyAt": ["lastsimplyreplyat","last simply reply at","lastsimplyreply","last simply reply"],
+    "LastClientReplyAt": ["lastclientreplyat","last client reply at","lastclientreply","last client reply"],
+    "ClientName": ["clientname","client","customer","customername"],
+    "Time to Close": ["time_to_close","timetoclose","ttc","resolutiontime","resolution time"],
+    "TAM": ["tam","account manager","technical account manager"],
+    "Closer": ["closer","agent","assignee","owner","handler"]
+}
+
+# Columns actually used by the app logic (others can exist but aren’t strictly needed for charts)
+USED = {
+    "status":   "Status",
+    "client":   "ClientName",
+    "tam":      "TAM",
+    "closer":   "Closer",
+    "ttc":      "Time to Close",
+    "created":  "CreatedAt",
+    "closed":   "ClosedAt",
     "reopened": "ReopenedAt",
 }
 
-POSSIBLE_PATHS = ["GAMING 2.csv", "/mnt/data/GAMING 2.csv", "data/GAMING 2.csv"]
-EXCLUDE_STATUSES_FOR_SPEED = {"pending", "processing"}
-DROP_NAMES = {"not found", "nan", "none", ""}
+EXCLUDE_STATUSES_FOR_SPEED = {"pending", "processing"}  # filter for speed/efficiency charts
+DROP_NAMES = {"not found", "nan", "none", ""}           # garbage tokens (case-insensitive)
 
 # ==============================
 # Helpers
 # ==============================
-def load_data(upload):
-    """Load CSV from upload or common local paths; show message if none found."""
-    if upload is not None:
-        df = pd.read_csv(upload)
+def _norm(s: str) -> str:
+    """Normalize a header: lowercase, strip, collapse spaces/underscores."""
+    return "".join(str(s).strip().lower().replace("_", " ").split())
+
+def resolve_schema(df: pd.DataFrame):
+    """
+    Return:
+      - colmap: dict canonical->actual column in df
+      - missing: list of canonical headers not present
+    """
+    actual_norm = {_norm(c): c for c in df.columns}
+    colmap = {}
+    missing = []
+    for canonical in REQUIRED_HEADERS:
+        candidates = [_norm(canonical)]
+        candidates += [_norm(a) for a in SYNONYMS.get(canonical, [])]
+        found = None
+        for cand in candidates:
+            if cand in actual_norm:
+                found = actual_norm[cand]
+                break
+        if found:
+            colmap[canonical] = found
+        else:
+            missing.append(canonical)
+    return colmap, missing
+
+def load_any(uploaded):
+    """Load CSV/TSV/XLSX; be liberal with delimiters; trim header whitespace."""
+    if uploaded is None:
+        # Optional fallback if you keep a sample next to the app
+        for p in ["GAMING 2.csv", "/mnt/data/GAMING 2.csv", "/mnt/data/gaming3.csv", "data/sample.csv"]:
+            if os.path.exists(p):
+                uploaded = open(p, "rb")
+                break
+        if uploaded is None:
+            return None
+
+    name = getattr(uploaded, "name", "uploaded")
+    data = uploaded.read() if hasattr(uploaded, "read") else uploaded
+    if hasattr(uploaded, "seek"):
+        uploaded.seek(0)
+
+    # Try Excel first
+    if name.lower().endswith((".xls", ".xlsx")):
+        df = pd.read_excel(io.BytesIO(data))
     else:
-        path = next((p for p in POSSIBLE_PATHS if os.path.exists(p)), None)
-        if not path:
-            st.title("Client Support — Closer Dashboard")
-            st.info(
-                "👋 Drop your CSV in the **sidebar** (or save it next to `app.py` as `GAMING 2.csv`).\n\n"
-                "**Required columns (case-insensitive):** `Closer`, `ClientName`, `Time to Close`.\n"
-                "Optional: `Status`, `ReopenedAt`, `ClosedAt`, `CreatedAt`."
-            )
-            st.stop()
-        df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
+        # Try common delimiters
+        for sep in [",", ";", "\t", "|"]:
+            try:
+                df = pd.read_csv(io.BytesIO(data), sep=sep)
+                # Heuristic: if it's clearly one big column, try next sep
+                if df.shape[1] == 1 and sep != ",":
+                    continue
+                break
+            except Exception:
+                df = None
+        if df is None:
+            df = pd.read_csv(io.BytesIO(data))  # last resort
+
+    # Trim headers
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
-def safe_col(df, *opts, default=None):
-    for c in opts:
-        if c in df.columns:
-            return c
-    return default
+def safe_col(colmap, canonical, *fallbacks):
+    """Return the actual column in df for a canonical name (or a provided fallback)."""
+    if canonical in colmap: 
+        return colmap[canonical]
+    for fb in fallbacks:
+        if fb in colmap:
+            return colmap[fb]
+    return None
 
 def clean_people(s: pd.Series) -> pd.Series:
-    s = s.astype("string").str.strip().str.replace(r"\s+", " ", regex=True)
-    return s
+    return s.astype("string").str.strip().str.replace(r"\s+", " ", regex=True)
 
 def percent_rank(series: pd.Series) -> pd.Series:
-    """0..1 percentile rank; if all equal, return 0.5."""
     if series.nunique(dropna=True) <= 1:
         return pd.Series(0.5, index=series.index)
     return series.rank(pct=True, method="average")
 
+# --- Robust TTC (Time to Close) -> hours parser ---
+def ttc_to_hours(s: pd.Series) -> pd.Series:
+    """
+    Coerce Time to Close to hours.
+    - Numeric strings like '11.5' are treated as HOURS (11.5h).
+    - Durations like '1 day 02:15:00', '02:15:00', '12h 30m', '45m', '90s'
+      are parsed via to_timedelta and converted to hours.
+    - Negative or absurd outliers are nulled.
+    """
+    s = s.astype("string").str.strip()
+
+    # 1) numeric-as-hours first
+    h_num = pd.to_numeric(s, errors="coerce")
+
+    # 2) anything not numeric → try timedelta
+    mask = h_num.isna()
+    td = pd.to_timedelta(s[mask], errors="coerce")
+    h_td = (td / np.timedelta64(1, "h")).astype("float")
+
+    # stitch back
+    hours = h_num.copy()
+    hours[mask] = h_td
+
+    # normalize: drop negatives & crazy outliers
+    hours = hours.where(hours >= 0)
+    if hours.notna().sum() > 5:
+        p99 = np.nanpercentile(hours, 99)
+        hours = hours.where(hours <= p99)
+    return hours
+
 def compute_reopen(df, closer_col, reopened_col):
-    """Reopen counts, rate, and penalty (0..15) per closer."""
     tmp = df.copy()
     if reopened_col in tmp.columns:
         tmp[reopened_col] = pd.to_datetime(tmp[reopened_col], errors="coerce", dayfirst=True)
     else:
         tmp[reopened_col] = pd.NaT
+
     tmp["_reopened_flag"] = tmp[reopened_col].notna()
 
     quality = (
@@ -103,53 +212,60 @@ def compute_reopen(df, closer_col, reopened_col):
     quality["reopen_rate"] = quality["reopens"] / quality["tickets_closed"].replace(0, np.nan)
     quality["reopen_rate"] = quality["reopen_rate"].fillna(0.0)
 
+    # penalty 0..15 by percentile
     MAX_PEN = 15.0
     quality["penalty"] = (percent_rank(quality["reopen_rate"]) * MAX_PEN).round(1)
-    return quality.rename(columns={closer_col: "Closer"})
+    return quality
 
-def score_closer_table(df, closer_col, client_col, ttc_col, reopened_col, status_col):
-    """Build leaderboard for Closers with normalized pillars + reopen penalty."""
+def score_closer_table(
+    df, closer_col, client_col, ttc_col, reopened_col, status_col, hours_col=None
+):
     d = df.copy()
 
-    # sanitize closer
+    # sanitize closer names
     d[closer_col] = clean_people(d[closer_col])
     d = d[d[closer_col].notna()]
     d = d[~d[closer_col].str.lower().isin(DROP_NAMES)]
 
-    # numeric TTC
-    if not np.issubdtype(d[ttc_col].dtype, np.number):
-        d[ttc_col] = pd.to_numeric(d[ttc_col], errors="coerce")
+    # choose hours for speed
+    if hours_col is None:
+        if not np.issubdtype(d[ttc_col].dtype, np.number):
+            d[ttc_col] = pd.to_numeric(d[ttc_col], errors="coerce")
+        hours_col = ttc_col
 
-    # volume
+    # --- Volume pillars
     vol = d.groupby(closer_col).size().reset_index(name="Tickets Closed")
 
-    # per-client throughput (tickets per closer across clients)
-    per_client = (
-        d.groupby([closer_col, client_col]).size()
-         .reset_index(name="cnt")
-         .groupby(closer_col)["cnt"].sum()
-         .reset_index(name="Closed per Client")
+    # unique clients & per-client throughput
+    uniq_clients = d.groupby(closer_col)[client_col].nunique().reset_index(name="Unique Clients")
+    per_client = vol.merge(uniq_clients, on=closer_col, how="left")
+    per_client["Closed per Client"] = (
+        per_client["Tickets Closed"] / per_client["Unique Clients"].replace(0, np.nan)
     )
 
-    # speed base — exclude pending/processing
+    # --- Speed (exclude pending/processing)
     speed_base = d.copy()
-    if status_col in speed_base.columns:
+    if status_col in speed_base.columns and status_col is not None:
         mask = ~speed_base[status_col].astype(str).str.lower().isin(EXCLUDE_STATUSES_FOR_SPEED)
         speed_base = speed_base[mask]
+
     speed = (
-        speed_base.groupby(closer_col)[ttc_col].mean().reset_index()
-                  .rename(columns={ttc_col: "Avg Close (h)"})
+        speed_base.groupby(closer_col)[hours_col].mean().reset_index()
+                  .rename(columns={hours_col: "Avg Close (h)"})
     )
 
-    # merge pillars
-    lb = vol.merge(per_client, on=closer_col, how="left").merge(speed, on=closer_col, how="left")
+    # Merge pillars
+    lb = (
+        vol.merge(per_client[[closer_col, "Closed per Client", "Unique Clients"]], on=closer_col, how="left")
+           .merge(speed, on=closer_col, how="left")
+    )
 
-    # normalized scores (0..100)
+    # --- Scores via percentile ranks (robust)
     lb["Volume Score (0–100)"]     = (percent_rank(lb["Tickets Closed"]) * 100).round(1)
     lb["Throughput Score (0–100)"] = (percent_rank(lb["Closed per Client"]) * 100).round(1)
-    lb["Speed Score (0–100)"]      = ((1 - percent_rank(lb["Avg Close (h)"])) * 100).round(1)  # lower hours = faster
+    lb["Speed Score (0–100)"]      = ((1 - percent_rank(lb["Avg Close (h)"])) * 100).round(1)
 
-    # base power (weights)
+    # Base power (weights)
     w_speed, w_through, w_vol = 0.30, 0.40, 0.30
     lb["POWER SCORE (0–100)"] = (
         lb["Speed Score (0–100)"] * w_speed
@@ -157,16 +273,16 @@ def score_closer_table(df, closer_col, client_col, ttc_col, reopened_col, status
       + lb["Volume Score (0–100)"] * w_vol
     ).round(1)
 
-    # re-open penalty
+    # Re-open penalty & adjusted power
     quality = compute_reopen(d, closer_col, reopened_col)
-    lb = lb.merge(quality[["Closer","reopen_rate","penalty","reopens","tickets_closed"]],
-                  left_on=closer_col, right_on="Closer", how="left")
-    lb = lb.fillna({"reopen_rate":0.0, "penalty":0.0, "reopens":0, "tickets_closed":0})
+    lb = lb.merge(
+        quality[[closer_col, "reopen_rate", "penalty", "reopens", "tickets_closed"]],
+        on=closer_col, how="left"
+    ).fillna({"reopen_rate":0.0, "penalty":0.0, "reopens":0, "tickets_closed":0})
 
-    # adjusted power
     lb["Adj POWER SCORE (0–100)"] = (lb["POWER SCORE (0–100)"] - lb["penalty"]).clip(lower=0)
 
-    # flavor title + tiers
+    # Titles + tiers
     lb["Title"] = np.where(lb["Speed Score (0–100)"] >= 70, "Lightning Closer", "Steady Operator")
     def tier_from_score(s):
         if s >= 80: return "Mythic 🟣"
@@ -175,45 +291,49 @@ def score_closer_table(df, closer_col, client_col, ttc_col, reopened_col, status
         return "Rare 🟢"
     lb["Tier"] = lb["Adj POWER SCORE (0–100)"].apply(tier_from_score)
 
-    # rank & order
-    lb = lb.rename(columns={closer_col:"Closer"})
+    lb = lb.rename(columns={closer_col: "Closer"})
     lb = lb.sort_values("Adj POWER SCORE (0–100)", ascending=False).reset_index(drop=True)
     lb.insert(0, "Rank", lb.index + 1)
 
-    return lb[
-        ["Rank","Closer","Title","Tier",
-         "Adj POWER SCORE (0–100)","penalty",
-         "Speed Score (0–100)","Throughput Score (0–100)","Volume Score (0–100)",
-         "Avg Close (h)","Tickets Closed","Closed per Client",
-         "reopens","reopen_rate"]
-    ].rename(columns={"penalty":"Re-open Penalty (0–15)","reopen_rate":"Re-open Rate",
-                      "reopens":"Reopens"})
+    cols = [
+        "Rank","Closer","Title","Tier",
+        "Adj POWER SCORE (0–100)","penalty",
+        "Speed Score (0–100)","Throughput Score (0–100)","Volume Score (0–100)",
+        "Avg Close (h)","Tickets Closed","Unique Clients","Closed per Client",
+        "reopens","reopen_rate"
+    ]
+    lb = lb[cols].rename(columns={
+        "penalty":"Re-open Penalty (0–15)",
+        "reopen_rate":"Re-open Rate",
+        "reopens":"Reopens"
+    })
+    return lb
 
-def styled_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    s = (df.style
-         # ↓ new API
-         .hide(axis="index")
-         .format({
-             "Adj POWER SCORE (0–100)":"{:.1f}",
-             "Re-open Penalty (0–15)":"{:.1f}",
-             "Speed Score (0–100)":"{:.1f}",
-             "Throughput Score (0–100)":"{:.1f}",
-             "Volume Score (0–100)":"{:.1f}",
-             "Avg Close (h)":"{:.2f}",
-             "Closed per Client":"{:.2f}",
-             "Re-open Rate":"{:.2%}",
-         })
-         .background_gradient(cmap="YlOrRd", subset=["Adj POWER SCORE (0–100)"])
-         .bar(subset=["Re-open Penalty (0–15)"], color="#ef4444")
-         .background_gradient(cmap="PuBuGn", subset=["Speed Score (0–100)"])
-         .background_gradient(cmap="BuGn",   subset=["Throughput Score (0–100)"])
-         .background_gradient(cmap="Greys",  subset=["Volume Score (0–100)"])
-         .background_gradient(cmap="RdYlGn_r", subset=["Avg Close (h)"])
-         .bar(subset=["Tickets Closed"], color="#6c5ce7")
-         .bar(subset=["Closed per Client"], color="#10b981")
+def styled_table(df: pd.DataFrame) -> str:
+    s = (
+        df.style
+          .format({
+              "Adj POWER SCORE (0–100)":"{:.1f}",
+              "Re-open Penalty (0–15)":"{:.1f}",
+              "Speed Score (0–100)":"{:.1f}",
+              "Throughput Score (0–100)":"{:.1f}",
+              "Volume Score (0–100)":"{:.1f}",
+              "Avg Close (h)":"{:.2f}",
+              "Closed per Client":"{:.2f}",
+              "Re-open Rate":"{:.2%}",
+          })
+          .background_gradient(cmap="YlOrRd", subset=["Adj POWER SCORE (0–100)"])
+          .bar(subset=["Re-open Penalty (0–15)"], color="#ef4444")
+          .background_gradient(cmap="PuBuGn", subset=["Speed Score (0–100)"])
+          .background_gradient(cmap="BuGn",   subset=["Throughput Score (0–100)"])
+          .background_gradient(cmap="Greys",  subset=["Volume Score (0–100)"])
+          .background_gradient(cmap="RdYlGn_r", subset=["Avg Close (h)"])
+          .bar(subset=["Tickets Closed"], color="#6c5ce7")
+          .bar(subset=["Closed per Client"], color="#10b981")
     )
-    return s
-
+    html = s.to_html()
+    html = html.replace("<tbody>", "<tbody>").replace("<th></th>", "")
+    return html
 
 def achievement_card(row, place):
     medal = {1:"🥇", 2:"🥈", 3:"🥉"}[place]
@@ -251,55 +371,129 @@ def achievement_card(row, place):
         unsafe_allow_html=True
     )
 
+def weekly_winner(df, closer_col, client_col, hrs_col, reopened_col, status_col, closed_col, created_col):
+    """Return (top_row, 'YYYY-Www') for the latest ISO week using ClosedAt (fallback CreatedAt)."""
+    date_col = closed_col if closed_col in df.columns and closed_col else created_col
+    if not date_col or date_col not in df.columns:
+        return None, None
+
+    d = df.copy()
+    d[date_col] = pd.to_datetime(d[date_col], errors="coerce", dayfirst=True)
+    d = d[d[date_col].notna()]
+    if d.empty:
+        return None, None
+
+    iso = d[date_col].dt.isocalendar()
+    d["_week"] = iso.year.astype(str) + "-W" + iso.week.astype(str).str.zfill(2)
+    latest_week = d["_week"].sort_values().iloc[-1]
+    dweek = d[d["_week"] == latest_week].copy()
+    if dweek.empty:
+        return None, None
+
+    lbw = score_closer_table(
+        dweek, closer_col=closer_col, client_col=client_col,
+        ttc_col=hrs_col, reopened_col=reopened_col, status_col=status_col,
+        hours_col=hrs_col
+    )
+    if lbw.empty:
+        return None, None
+    return lbw.iloc[0], latest_week
+
 # ==============================
-# Sidebar — data load & options
+# Sidebar — data load & schema
 # ==============================
 st.sidebar.header("Load data")
-uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
-df = load_data(uploaded)
+uploaded = st.sidebar.file_uploader("Upload CSV/TSV/XLSX", type=["csv","tsv","txt","xls","xlsx"])
+df = load_any(uploaded)
 
-# Resolve columns dynamically
-status_col   = safe_col(df, COLS["status"], "status")
-client_col   = safe_col(df, COLS["client"], "Client")
-closer_col   = safe_col(df, COLS["closer"], "Closer")
-ttc_col      = safe_col(df, COLS["ttc"], "Time to Close", "time_to_close", "TTC")
-reopened_col = safe_col(df, COLS["reopened"], "ReopenedAt", "reopenedat")
-closed_col   = safe_col(df, COLS["closed"], "ClosedAt", "closedat")
-created_col  = safe_col(df, COLS["created"], "CreatedAt", "createdat")
+st.title("Client Support — Closer Dashboard")
 
-required = [client_col, closer_col, ttc_col]
-if any(c is None for c in required):
-    st.error("Your CSV is missing required columns (Closer, ClientName, Time to Close).")
+if df is None or df.empty:
+    st.info(
+        "👋 Upload a file with the required headers:\n\n"
+        "`ID, ClientID, Status, Title, Field, Service, Category, CreatedAt, UpdatedAt, "
+        "AcknowledgedAt, ProcessingAt, ClosedAt, ReopenedAt, LastSimplyReplyAt, "
+        "LastClientReplyAt, ClientName, Time to Close, TAM, Closer`"
+    )
     st.stop()
+
+# Validate / normalize schema
+colmap, missing = resolve_schema(df)
+
+with st.expander("Schema check", expanded=bool(missing)):
+    ok = "✅"
+    bad = "❌"
+    cols_state = []
+    for h in REQUIRED_HEADERS:
+        cols_state.append(f"{ok if h in colmap else bad} {h} → {colmap.get(h,'(missing)')}")
+    st.write("\n".join(cols_state))
+if missing:
+    st.error(f"Your file is missing required columns: {', '.join(missing)}")
+    st.stop()
+
+# Resolve columns used by the app
+status_col   = colmap[USED["status"]]
+client_col   = colmap[USED["client"]]
+tam_col      = colmap[USED["tam"]]
+closer_col   = colmap[USED["closer"]]
+ttc_col      = colmap[USED["ttc"]]
+reopened_col = colmap[USED["reopened"]]
+closed_col   = colmap[USED["closed"]]
+created_col  = colmap[USED["created"]]
 
 # Filters
 st.sidebar.header("Filters")
 exclude_names = st.sidebar.multiselect(
     "Exclude Closers",
     sorted(df[closer_col].dropna().astype(str).unique()),
-    default=["Bas","Estefy","Shub"]
+    default=[]
 )
 show_top_n = st.sidebar.slider("Top N for charts", 5, 20, 15)
 
-# Apply basic cleaning & exclusions
+# Basic cleaning / exclusions
 df[closer_col] = clean_people(df[closer_col])
 df = df[~df[closer_col].str.lower().isin({n.lower() for n in exclude_names})]
+
+# Robust “hours” for all speed/avg metrics
+hrs_col = "_ttc_hours"
+df[hrs_col] = ttc_to_hours(df[ttc_col])
 
 # ==============================
 # KPIs
 # ==============================
 with st.container():
-    c1, c2, c3, c4 = st.columns(4)
+    k1, k2, k3, k4 = st.columns(4)
     total_tickets = len(df)
     unique_clients = df[client_col].nunique()
     unique_closers = df[closer_col].nunique()
-    avg_ttc = pd.to_numeric(df[ttc_col], errors="coerce").mean()
-    c1.metric("Tickets", f"{total_tickets:,}")
-    c2.metric("Unique Clients", f"{unique_clients:,}")
-    c3.metric("Closers", f"{unique_closers:,}")
-    c4.metric("Avg Close (h)", f"{avg_ttc:.2f}" if pd.notna(avg_ttc) else "—")
+    avg_ttc = df[hrs_col].mean()
+    k1.metric("Tickets", f"{total_tickets:,}")
+    k2.metric("Unique Clients", f"{unique_clients:,}")
+    k3.metric("Closers", f"{unique_closers:,}")
+    k4.metric("Avg Close (h)", f"{avg_ttc:.2f}" if pd.notna(avg_ttc) else "—")
 
 st.markdown("---")
+
+# Winner of the Week banner
+topw, week_label = weekly_winner(df, closer_col, client_col, hrs_col,
+                                 reopened_col, status_col, closed_col, created_col)
+if topw is not None:
+    st.markdown(
+        f"""
+        <div style="margin:8px 0 18px; padding:14px 18px; background:#0ea5e9; color:white;
+                    border-radius:14px; box-shadow:0 8px 18px rgba(0,0,0,.10);">
+          <div style="font-weight:800; font-size:18px;">🏁 Winner of <span style="opacity:.9">{week_label}</span></div>
+          <div style="display:flex; gap:22px; align-items:baseline; flex-wrap:wrap;">
+            <div style="font-size:30px; font-weight:800;">{topw['Closer']}</div>
+            <div>Adj Power: <b>{topw['Adj POWER SCORE (0–100)']:.1f}</b></div>
+            <div>Tickets: <b>{int(topw['Tickets Closed'])}</b></div>
+            <div>Avg Close (h): <b>{topw['Avg Close (h)']:.2f}</b></div>
+            <div>Closed/Client: <b>{topw['Closed per Client']:.2f}</b></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 # ==============================
 # Tabs
@@ -308,7 +502,7 @@ tab1, tab2, tab3 = st.tabs(["📊 Charts", "🏆 Leaderboard", "🎖 Achievement
 
 # ---------- Charts ----------
 with tab1:
-    colA, colB = st.columns(2)
+    c1, c2 = st.columns(2)
 
     # Top clients by tickets
     clients_df = (
@@ -317,14 +511,13 @@ with tab1:
     )
     fig_clients = px.bar(
         clients_df, x="tickets_count", y=client_col, orientation="h", color="tickets_count",
-        title="👑 Which client generated the most tickets?",
-        labels={"tickets_count":"Tickets", client_col:"Client"},
+        title="👑 Which client generated the most tickets?", labels={"tickets_count":"Tickets", client_col:"Client"},
         template="simple_white",
     )
     fig_clients.update_yaxes(categoryorder="total ascending")
-    colA.plotly_chart(fig_clients, use_container_width=True)
+    c1.plotly_chart(fig_clients, use_container_width=True)
 
-    # Tickets closed by closer (exclude pending/processing)
+    # Closers by tickets closed (exclude pending/processing)
     df_closed = df.copy()
     if status_col in df_closed.columns:
         df_closed = df_closed[~df_closed[status_col].astype(str).str.lower().isin(EXCLUDE_STATUSES_FOR_SPEED)]
@@ -339,12 +532,12 @@ with tab1:
         labels={"tickets_closed":"Tickets", closer_col:"Closer"},
         template="simple_white",
     )
-    colB.plotly_chart(fig_closer, use_container_width=True)
+    c2.plotly_chart(fig_closer, use_container_width=True)
 
     # Fastest closers (avg hours) — exclude pending/processing
     avg_df = (
-        df_closed.groupby(closer_col)[ttc_col].mean().reset_index()
-                 .rename(columns={ttc_col:"avg_hours"})
+        df_closed.groupby(closer_col)[hrs_col].mean().reset_index()
+                 .rename(columns={hrs_col:"avg_hours"})
                  .sort_values("avg_hours", ascending=True).head(show_top_n)
     )
     fig_speed = px.bar(
@@ -382,13 +575,14 @@ with tab1:
 with tab2:
     lb = score_closer_table(
         df, closer_col=closer_col, client_col=client_col,
-        ttc_col=ttc_col, reopened_col=reopened_col, status_col=status_col
+        ttc_col=ttc_col, reopened_col=reopened_col, status_col=status_col,
+        hours_col=hrs_col
     )
 
     st.subheader("🏆 Power Leaderboard (Closer) — with Re-open Penalty & Normalized Scores")
     st.caption("Adjusted Power = 0.3·Speed + 0.4·Per-Client + 0.3·Volume − Penalty (0–15).")
 
-    st.markdown(styled_table(lb).to_html(), unsafe_allow_html=True)
+    st.markdown(styled_table(lb), unsafe_allow_html=True)
 
     with st.expander("Show raw table"):
         st.dataframe(lb, use_container_width=True)
@@ -397,7 +591,8 @@ with tab2:
 with tab3:
     lb = score_closer_table(
         df, closer_col=closer_col, client_col=client_col,
-        ttc_col=ttc_col, reopened_col=reopened_col, status_col=status_col
+        ttc_col=ttc_col, reopened_col=reopened_col, status_col=status_col,
+        hours_col=hrs_col
     )
     top3 = lb.head(3).reset_index(drop=True)
     a,b,c = st.columns(3)
@@ -408,4 +603,5 @@ with tab3:
     if len(top3) > 2:
         with c: achievement_card(top3.iloc[2], 3)
 
-    st.markdown('<div class="note">Tip: use the sidebar to exclude names (e.g., Bas/Estefy/Shub) or to change Top-N on charts.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="note">Tip: use the sidebar to exclude names or change Top-N on charts.</div>', unsafe_allow_html=True)
+
