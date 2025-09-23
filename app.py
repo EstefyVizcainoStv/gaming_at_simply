@@ -397,12 +397,13 @@ exclude_names = st.sidebar.multiselect(
 show_top_n = st.sidebar.slider("Top N for charts", 5, 20, 15)
 
 # Basic cleaning / exclusions
-df[closer_col] = clean_people(df[closer_col]])
+df[closer_col] = clean_people(df[closer_col])
 df = df[~df[closer_col].str.lower().isin({n.lower() for n in exclude_names})]
 
 # Robust “hours” for all speed/avg metrics
 hrs_col = "_ttc_hours"
 df[hrs_col] = ttc_to_hours(df[ttc_col])
+
 
 # ==============================
 # KPIs
