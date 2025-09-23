@@ -319,6 +319,42 @@ def styled_table(df: pd.DataFrame) -> str:
     html = html.replace("<th></th>", "")
     return html
 
+def achievement_card(row, place):
+    medal = {1:"🥇", 2:"🥈", 3:"🥉"}[place]
+    grad  = {1:"linear-gradient(90deg,#f59e0b,#b45309)",
+             2:"linear-gradient(90deg,#9ca3af,#6b7280)",
+             3:"linear-gradient(90deg,#b45309,#92400e)"}[place]
+    name  = row["Closer"]
+    title = row["Title"]
+    tier  = row["Tier"]
+    adj   = f'{row["Adj POWER SCORE (0–100)"]:.1f}'
+    pen   = f'{row["Re-open Penalty (0–15)"]:.1f}'
+    rate  = f'{row["Re-open Rate"]:.2%}'
+    avg   = f'{row["Avg Close (h)"]:.2f}'
+    per   = f'{row["Closed per Client"]:.2f}'
+    vol   = f'{row["Tickets Closed"]:.0f}'
+
+    st.markdown(
+        f"""
+        <div class="card">
+          <div class="card-h" style="background:{grad}">{medal} ACHIEVEMENT UNLOCKED</div>
+          <div class="card-b">
+            <div class="big">CLOSER: {name}</div>
+            <div class="meta">Title: “{title}”</div>
+            <div class="meta">Tier: {tier}</div>
+            <div class="pow">Adjusted Power: {adj}</div>
+            <div class="sub">(Penalty: {pen} · Re-open rate: {rate})</div>
+            <div class="stats">
+              <div>Avg Close (h): <b>{avg}</b></div>
+              <div>Closed per Client: <b>{per}</b></div>
+              <div>Tickets Closed: <b>{vol}</b></div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 def weekly_winner(df, closer_col, client_col, hrs_col, reopened_col, status_col, closed_col, created_col):
     """Return (top_row, latest_week_label) — we do not display the label anymore."""
     date_col = closed_col if closed_col in df.columns and closed_col else created_col
@@ -396,14 +432,13 @@ exclude_names = st.sidebar.multiselect(
 )
 show_top_n = st.sidebar.slider("Top N for charts", 5, 20, 15)
 
-# Basic cleaning / exclusions
+# Basic cleaning / exclusions  (FIXED bracket)
 df[closer_col] = clean_people(df[closer_col])
 df = df[~df[closer_col].str.lower().isin({n.lower() for n in exclude_names})]
 
 # Robust “hours” for all speed/avg metrics
 hrs_col = "_ttc_hours"
 df[hrs_col] = ttc_to_hours(df[ttc_col])
-
 
 # ==============================
 # KPIs
@@ -442,7 +477,7 @@ if topw is not None:
 # ==============================
 # Tabs
 # ==============================
-tab1, tab2, tab3 = st.tabs(["📊 Charts", "🏆 Leaderboard", "🔄 Re-opens"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Charts", "🏆 Leaderboard", "🎖 Achievements", "🔄 Re-opens"])
 
 # ---------- Charts ----------
 with tab1:
@@ -506,8 +541,29 @@ with tab2:
     with st.expander("Show raw table"):
         st.dataframe(lb, use_container_width=True)
 
-# ---------- Re-opens (consistent with penalty) ----------
+# ---------- Achievements (robust dynamic layout) ----------
 with tab3:
+    lb = score_closer_table(
+        df, closer_col=closer_col, client_col=client_col,
+        ttc_col=ttc_col, reopened_col=reopened_col, status_col=status_col,
+        hours_col=hrs_col
+    )
+    if lb.empty:
+        st.info("No data to compute achievements yet.")
+    else:
+        top3 = lb.head(3).reset_index(drop=True)
+        cols = st.columns(len(top3))
+        for i in range(len(top3)):
+            with cols[i]:
+                achievement_card(top3.iloc[i], i + 1)
+
+    st.markdown(
+        '<div class="note">Tip: use the sidebar to exclude names or change Top-N on charts.</div>',
+        unsafe_allow_html=True
+    )
+
+# ---------- Re-opens (consistent with penalty) ----------
+with tab4:
     quality = compute_reopen(df, closer_col, reopened_col)
 
     # Overall *smoothed* re-open rate (matches the leaderboard penalty)
@@ -525,7 +581,7 @@ with tab3:
     fig_rate.update_yaxes(categoryorder="total ascending")
     st.plotly_chart(fig_rate, use_container_width=True)
 
-    # Optional: latest-week *counts* (clearly labeled, so it doesn't conflict with penalty logic)
+    # Optional: latest-week *counts*
     tmp = df.copy()
     if reopened_col:
         tmp[reopened_col] = pd.to_datetime(tmp[reopened_col], errors="coerce", dayfirst=True)
