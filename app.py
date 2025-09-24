@@ -82,8 +82,8 @@ DROP_NAMES = {"not found", "nan", "none", ""}
 # --- Re-open penalty configuration (Bayesian smoothing) ---
 MAX_PENALTY = 15.0
 # Prior of ~5% re-open rate -> (alpha / (alpha+beta)) ≈ 0.05
-REOPEN_PRIOR_ALPHA = 1.0
-REOPEN_PRIOR_BETA  = 19.0
+REOPEN_PRIOR_ALPHA = 0.0
+REOPEN_PRIOR_BETA  = 0.0
 
 # ==============================
 # Helpers
